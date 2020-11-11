@@ -1,1 +1,309 @@
 
+## 1 neutron api v2 流程 ##
+## neutron api v2 流程
+ > 代码路径： neutrin-> api -> v2
+
+### router.py
+  > 描述请求url 和 资源执行方法的mapping关系；方法实现在base.py的Controller中。
+
+### base.py
+  > api 操作时，调用controller类实现的通用方法
+  - 方法包括资源的 create，update，delete，index，show
+
+  * 方法实现的通用顺序：判断参数的合法性（prepare_request_body，合法性在attributes中定义）
+  -> policy权限检查 -> 调用plugin 的操作方法（create,update,delete,index,show）-> policy过滤需要展示的属性 -> 向其他影响的资源发送消息（notify，send_nova_notification，dhcp_agent_notifier）
+
+## 2 
+neutron-dhcp-agent 初始化流表过程
+/usr/bin/neutron-dhcp-agent --config-file=/etc/neutron/neutron_dhcp.conf --config-file=/etc/neutron/dhcp_agent.ini
+
+neutron.agent.dhcp.agent.DhcpPluginApi中的api通过rpc调用neutron.api.rpc.handlers.dhcp_rpc.DhcpRpcCallback 中的同名回调方法。
+
++------------------------------------------------------------------------------------+ 
+(一) neutron-dhcp-agent  初始化过程：
++------------------------------------------------------------------------------------+ 
+（1）说明：
+	interface_driver: neutron.agent.linux.interface.OVSInterfaceDriver
+	dhcp_driver = neutron.agent.linux.dhcp.Dnsmasq
+	dhcp_confs = /var/lib/neutron/dhcp
+	DhcpAgent(neutron.agent.dhcp.agent.py)的rpc_plugin(DeviceManager中的plugin): DhcpPluginApi
+	NetworkCache: # cache = {dhcp.NetModel({"id": net-id; "subnets": []; "ports": []}), ......}; subnet_lookup = {}; port_lookup = {}
+	self._metadata_routers = {}  # {network_id: router_id}
+
+（2） 启动dhcp-agent方法主要在/neutron/agent/dhcp/agent.py 中的 periodic_resync 方法从开启协程，周期性的执行_periodic_resync_helper 方法来resync dhcp 状态。
+    2.1 DhcpAgent中的 needs_resync_reasons 字典保存了指定需要resync的资源和原因。key为network-id，value为reason, 然后在通过 sync_state 方法来sync dhcp。
+	2.2 sync_state 会通过 rpc plugin获取active-networks，并对network封装成NetModel（此时network.namespace = qdhcp + ${net_id}）; needs_resync_reasons 中为
+		指定需要sync的network-ids；DhcpAgent中 cache 中的是 Known-networks。则known_network_ids - active_network_ids ：deleted-networks； 如果存在指定的
+		needs_resync_reasons资源，active_network_ids中除了不在指定资源中且在 Known-networks中的不执行，其他的networks都要sync； 如果不存在指定的
+		needs_resync_reasons资源，执行sync所有的active-networks。
+	2.3 对于单个network（通过agent侧的rpc_plugin从北向获得的network object），如果admin_status=true,且存在enable dhcp的subnet，则 configure_dhcp_for_network
+	方法调用dhcp_driver(neutron.agent.linux.dhcp.Dnsmasq)的enable方法为network创建dhcp服务。
+	2.4 如果dhcp_driver的enable方法为创建dhcp服务成功，调用update_isolated_metadata_proxy(network)方法，并把network加入到cache中将改network变为步骤2中的
+		Known-networks。如果dhcp_driver的enable方法为创建dhcp服务失败，则不更新metadata_proxy以及将network加入到cache中。
+	启动dhcp-agent完成。
+	
+	(step 2.3) dhcp_driver enable dhcp服务过程：
+		2.3.1 neutron/agent/linux/dhcp.py #Dnsmasq enable 启动dhcp的过程
+			2.3.1.1 判断dhcp目录是否存在（/var/lib/neutron/dhcp）
+			2.3.1.2 neutron/agent/linux/dhcp.py  #DeviceManager setup(network) 返回dhcp_port的interface_name
+				(a) 初始化创建dhcp_port元数据信息：
+					生成dhcp port的device_id：dhcp${host_uuid}-${network_id} 如：dhcp36195b25-dbd6-5aba-b25a-b5654b59e96a-6a0cb01b-4a66-4e60-bdbf-dda9d5f620ac
+					获取network中enable dhcp的subnets
+					if interface_driver设置了use_gateway_ips；
+						每个子网需要为dhcp_port分配一个fixIp
+					通过DhcpAgent中的rpc_plugin调用create_dhcp_port 方法北向发送rpc请求，通过neutronManager调用Core-plugin的create_port方法创建dhcp_port并返回dhcp_port信息到agent侧。
+					设置dhcp_port的fixed_ips
+					更新从北向获取的network object的ports中dhcp_port信息
+				(b) 获取dhcp_port的网卡名interface_name: tap + ${port_id} 取前14位长度的字符。如tap2218e17f-9a。
+				(c) 在dhcp的namespace中检查dhcp_port网卡是否存在。 执行ip netns exec dhcp-6a0cb01b-4a66-4e60-bdbf-dda9d5f620ac ip link set ${interface_name} up 命令，如报异常，则不存在，需要创建。
+				(d) 如dhcp_port网卡不存在，创建dhcp_port网卡并up 网卡：
+				   判断网卡设备是否存在。执行 ip netns exec  dhcp-6a0cb01b-4a66-4e60-bdbf-dda9d5f620ac ip -o link show ${interface_name},判断返回结果中是否包含 link/ether 属性。 
+				   如果存在，将网卡up起来；如果不存在，创建该网卡：
+						self.check_bridge_exists(bridge): ip -o link br-int
+						获取tap_name:
+							如果self.conf.ovs_use_veth = true；tap_name 为将interface_name使用 "ns-"前缀替换 "tap"前缀。否则 tap_name = interface_name	       
+						self._ovs_add_port(bridge, tap_name, port_id, mac_address,internal=internal) #先删除然后在创建ofport，然后在设置属性
+							ovs-vsctl --may-exist del-port bridge tap_name
+							ovs-vsctl --may-exist add-port bridge tap_name 
+							ovs-vsctl -- set Interface tap_name external_ids:iface-id=port_id external_ids:iface-status=active external_ids:attached-mac=mac_address external_ids:internal=false
+						设置mac地址
+							ip netns exec dhcp-6a0cb01b-4a66-4e60-bdbf-dda9d5f620ac ip link set tap_name address mac_address
+						如果非veth模式，确定namespace是否存在。执行ip -o netns list 返回结果中看是否与namespace 同名的行。如有，则存在，否则创建namespace：
+							ip netns add dhcp-6a0cb01b-4a66-4e60-bdbf-dda9d5f620ac
+							ip netns exec dhcp-6a0cb01b-4a66-4e60-bdbf-dda9d5f620ac sysctl -w net.ipv4.conf.all.promote_secondaries=1
+							ip netns exec dhcp-6a0cb01b-4a66-4e60-bdbf-dda9d5f620ac ip link set lo up
+							将网卡添加到namespace中：
+							ip set tap2218e17f-9a netns dhcp-6a0cb01b-4a66-4e60-bdbf-dda9d5f620ac
+						设置mtu
+							ip link netns exec dhcp-cd820ab8-e772-46f0-be5b-69035772b09d ip link set tap_name 1600
+						将网卡up起来:
+							ip netns exec dhcp-cd820ab8-e772-46f0-be5b-69035772b09d ip link set tap_name up
+						self.fill_dhcp_udp_checksums(namespace=network.namespace): # 确保dhcp reply包的udp checksum总是正确
+							ip netns exec dhcp-cd820ab8-e772-46f0-be5b-69035772b09d iptalbes --table mangle --insert POSTROUTING -p udp -m udp --dport 68 -j CHECKSUM --checksum-fill
+							ip netns exec dhcp-cd820ab8-e772-46f0-be5b-69035772b09d iptalbes-restore
+							
+				(e) 将dhcp_port的fixedips地址转换为cidr的格式(fixIp/net.prefixlen,如 192.168.0.2/24)；保存到列表变量ip_cidrs中
+				(f) 如果self.driver.use_gateway_ips = true； 将network中enable_dhcp=true的子网的网关ip以cidr的格式添加到ip_cidrs中
+				(g) if self.conf.force_metadata or self.conf.enable_isolated_metadata:
+						将metada默认的cidr 169.254.169.254/32 添加到ip_cidr中。
+				(h)interface_driver初始化l3：		
+					查看网卡现有的ip addrs，保存到previous。 执行  ip netns exec qdhcp-6a0cb01b-4a66-4e60-bdbf-dda9d5f620ac ip addr show  tap1136b328-51 permanent 
+					给网卡增加新的ip addr。将ip_cidr中不在 previous中的ip_cidr 添加到网卡中去：
+						ip netns exec qdhcp-6a0cb01b-4a66-4e60-bdbf-dda9d5f620ac ip -4(or -6) addr add  ${ip_cidr} brd ${} scope global dev ${tap_name} 
+					清除旧的的ip_cidr：
+						if  clean_connections = true：# 删除地址以及 conntrack state
+							ip netns exec qdhcp-6a0cb01b-4a66-4e60-bdbf-dda9d5f620ac ip -4(or -6) addr del ${ip_cidr} dev ${tap_name} 
+							ip netns exec qdhcp-6a0cb01b-4a66-4e60-bdbf-dda9d5f620ac ip conntrack -D -d ${ip_cidr} # ingress packages
+							ip netns exec qdhcp-6a0cb01b-4a66-4e60-bdbf-dda9d5f620ac ip conntrack -D -q ${ip_cidr} # egress  packages
+						else:
+							ip netns exec qdhcp-6a0cb01b-4a66-4e60-bdbf-dda9d5f620ac ip -4(or -6) addr del ${ip_cidr} dev ${tap_name} 
+				(i)设置默认路由：
+					获取默认路由的ip_cidr以及路由的metric。执行 ip netns exec qdhcp-6a0cb01b-4a66-4e60-bdbf-dda9d5f620ac ip route list 在返回结果中找到以default 开头的行
+					轮询network的subnets，如果子网的网关不等于namespace获取的默认路由ip_cidr,重新设置dhcp netns的网关。
+						如果获取的默认路由ip_cidr（即gateway） 不在network的subnet中，将当前的ip4和ip6路由中包含该ip_cidr的路由删除。执行如下命令：
+							ip netns exec qdhcp-6a0cb01b-4a66-4e60-bdbf-dda9d5f620ac ip -4(or -6) route list scope link  执行结果返回的router 过滤掉包含 src 字符串的routers
+							如果gateway在返回的routers中，删除该router:
+								ip netns exec qdhcp-6a0cb01b-4a66-4e60-bdbf-dda9d5f620ac ip -4(or -6) route del ${ip_cidr} dev ${tap_name} scope link 
+						如果subnet的网关不在subnet的cidr内，增加subnet 的gateway 路由：
+							ip netns exec qdhcp-6a0cb01b-4a66-4e60-bdbf-dda9d5f620ac ip -4(or -6) route replace ${subnet.gateway_ip} dev  ${tap_name} scope link 
+						增加subnet的网关ip_address为路由网关：
+							ip netns exec qdhcp-6a0cb01b-4a66-4e60-bdbf-dda9d5f620ac ip -4(or -6) route replace default via ${subnet.gateway_ip} dev  ${tap_name} 
+					如果network中无subnet，且ip netns中获取到的默认路由存在，删除路由:
+						ip netns exec qdhcp-6a0cb01b-4a66-4e60-bdbf-dda9d5f620ac ip -4(or -6) route del default via ${ip_cidr}
+				(j)清除network中的stale device网卡,即删除dhcp netns中除dhcp port device的其他网卡,lo 网卡除外：
+					查找netns中所有网卡命令：ip netns exec qdhcp-6a0cb01b-4a66-4e60-bdbf-dda9d5f620ac find /sys/class/net -maxdepth 1 -type l(L的小写) -printf %f
+					ovs从网桥上unplug 网卡： ovs-vsctl --if-exists del-port bridge tap_name
+			2.3.1.3 self.spawn_process()			
+				(a)生成dnsmasq	第一次启动时用到的lease 文件。lease文件在dnsmaq start时通过 --dhcp-leasefile ${leasefile} 进行配置。file格式：epoch-timestamp mac_addr ip_addr hostname client-ID
+					获取lease文件路径。该文件位于${confs_dir}/${net-id}/lease. 如/etc/neutron/dhcp/${net-id}/lease.
+					获取dhcp lease时间。0表示无限大。可通过dhcp_lease_duration参数配置
+					计算network 中port 的fixIps 对应的 host_tuple(port, alloc, hostname, name, no_dhcp, no_opts),处理后以[timestamp, port.mac_address, ip_address]写入 lease文件中。
+					tips：
+						If a port with v6 extra_dhcp_opts is on a network with IPv4 and IPv6 stateless subnets. IPv4的记录将排在前面。如“
+							fa:16:3e:8f:9d:65,30.0.0.5,set:aabc7d33-4874-429e-9637-436e4232d2cd
+							(entry for IPv4 dhcp)
+							fa:16:3e:8f:9d:65,set:aabc7d33-4874-429e-9637-436e4232d2cd
+							(entry for stateless IPv6 for v6 options)				
+				(b)spawn或reload network的dnsmasq 进程：
+					生成dhcp hostfile 并写入到${confs_dir}/${net-id}/host 文件中。通过--dhcp-hostsfile 选项配置。格式：'mac_address,FQDN,ip_address' 如：
+						（port.mac_address, 'set:', port.id） or (port.mac_address, self._ID, client_id, name,ip_address, 'set:', port.id) or （port.mac_address, self._ID, client_id, name,ip_address）
+						or （port.mac_address, name, ip_address,'set:', port.id） or (port.mac_address, name, ip_address)
+					生成dhcp additional hosts 文件。写入到	${confs_dir}/${net-id}/addn_hosts 文件中。通过 --addn-hosts 选项配置。格式：'alloc.ip_address, fqdn, hostname'	
+					生成dhcp options  文件。写入到	${confs_dir}/${net-id}/ops	文件中。通过 --dhcp-optsfile 选项配置。格式：'alloc.ip_address, fqdn, hostname'
+					启动dnsmasq 服务.在root用户下，执行ip netns exec ${dhcp-namespace} ${cmd}； 将cmd用如下命令替换:
+						dnsmasq --no-hosts --no-resolve [${dnsmasq_dns_servers}] --strict-order --except-interface=lo --pid-file=%s --dhcp-hostsfile=${hostfile_file} --addn-hosts=${addn-hosts_file} 
+						--dhcp-optsfile=${optsfile} --dhcp-leasefile=${dhcp-leasefile} --dhcp-match=set:ipxe,175 [--bind-interfaces --interface=${interface_name}] [--dhcp-range=set:tap${i},${cidr.network}
+						,static,infinite] [--dhcp-option-force=option:mtu,${mtu_value}] --dhcp-lease-max=86400  --conf-file=${config-file} [--server=8.8.8.8 [--server=${server_ip} ...] [--domain=${dhcp_domain}]
+						[--dhcp-broadcast] [--log-queries --log-dhcp --log-facility=${log_file}]
+						or 动态绑定：
+						dnsmasq --no-hosts --no-resolve [${dnsmasq_dns_servers}] --strict-order --except-interface=lo --pid-file=%s --dhcp-hostsfile=${hostfile_file} --addn-hosts=${addn-hosts_file} 
+						--dhcp-optsfile=${optsfile} --dhcp-leasefile=${dhcp-leasefile} --dhcp-match=set:ipxe,175 [--bind-dynamic --interface=${interface_name} --interface=tap* --bridge-interface=${interface_name},tap*]
+						[--dhcp-range=set:tap${i},${cidr.network},static,infinite] [--dhcp-option-force=option:mtu,${mtu_value}] --dhcp-lease-max=86400  --conf-file=${config-file} 
+						[--server=8.8.8.8 [--server=${server_ip} ...] [--domain=${dhcp_domain}] [--dhcp-broadcast] [--log-queries --log-dhcp --log-facility=${log_file}]
+					process_monitor注册 dnsmasq 的process_process 服务。uuid为network的id，服务名称：dnsmasq。monitor_process为启动dnsmasq服务的处理过程。
+    
+	(step 2.4) dhcp_driver update_isolated_metadata_proxy(network)方法过程：
+		2.3.1 dhcp_agent 更新metadata proxy过程。update_isolated_metadata_proxy(network)：
+				2.3.1.1 通过配置文件中force_metadata，enable_metadata_network，enable_isolated_metadata 配置来决定是否启动还是关闭network的metadata_proxy服务。
+				2.3.1.2 启动network的metadata_proxy过程：
+					在network中的ports中找到router_ports.如果router_ports为多个，报错终止。如果只有一个router_port，调用 MetadataDriver（neutron.agent.metadata.driver.py）的spawn_monitored_metadata_proxy来enable服务:
+					1.初始化external_process.ProcessManager实例。该实例的回调方法为_get_metadata_proxy_callback。该方法为启动metadata-proxy 服务的命令行.启动命令行如下：
+						neutron-ns-metadata-proxy --pid_file=${pid-file} --metadata_proxy_socket=${conf.metadata_proxy_socket} --network_id=${net-id} (or --router_id=${router-id}) --state_path=${conf.state_path}
+						--metadata_port=80 [--metadata_proxy_user=${user}] [--metadata_proxy_group=${group}] [--debug] [--verbose] [--log-file={log-file} --log-dir=${log-dir} --nometadata_proxy_watch_log] (or 
+						--use-syslog --syslog-log-facility=${conf.syslog_log_facility})
+						如：
+						python /bin/neutron-ns-metadata-proxy --pid_file=/var/lib/neutron/external/pids/6a0cb01b-4a66-4e60-bdbf-dda9d5f620ac.pid 
+						--metadata_proxy_socket=/var/lib/neutron/metadata_proxy --network_id=6a0cb01b-4a66-4e60-bdbf-dda9d5f620ac --state_path=/var/lib/neutron --metadata_port=80
+					2.调用ProcessManager实例的enable方法。enable 方法执行逻辑是在namespace中执行启动metadata-proxy 服务的命令行。 ip netns exec ${namespace} ${cmd}
+					3. process_monitor注册 metadata-proxy 服务。uuid为router_id(如果为空则为network_id),服务名称：metadata-proxy。monitor_process为ProcessManager实例。
+				2.3.1.3 disable服务如果有停止服务的cmd则ProcessManager调用cmd来停止，否则直接通过kill -9 ${pid} 来停止。		
+	
+	（注）neutron-ns-metadata-proxy 代理服务进程的作用逻辑：
+		neutron-ns-metadata-proxy命令调用了neutron.agent.metadata.namespace_proxy.py的main方法。该方法启动一个proxy server（进程名：neutron-network-metadata-proxy，端口：cfg.CONF.metadata_port），将nameserver中
+		发送到80（neutron-ns-metadata-proxy --metadata_port配置项配置的端口）的请求转发到169.254.169.254的80端口，返回响应。
+	
+### 3 	
+neutron-l3-agent 初始化流表过程
+/usr/bin/neutron-l3-agent --config-file=/etc/neutron/neutron_dvr_compute.conf --config-file=/etc/neutron/dvr_compute_agent.ini
+
+说明：
+1  "//" 为 neutron-l3-agent 初始化过程的一个step步骤标记		
+
++------------------------------------------------------------------------------------+ 
+(一) neutron-l3-agent 初始化过程：
++------------------------------------------------------------------------------------+ 
+/usr/bin/neutron-l3-agent 调用neutron.agent.l3_agent.py中的main()方法来启动neutron-l3-agent服务。main()方法中创建一个加载了neutron.agent.l3.agent.L3NATAgentWithStateReport管理器的server，
+然后启动这个server。launch server时，会调用server的start()方法。
+
+（1） neutron.agent.l3_agent.py 中main（）方法启动过程：
+   1.1. 初始化 manager： neutron.agent.l3.agent.L3NATAgentWithStateReport：
+   1.2. 初始化 neutron.service.py 中 class Service(n_rpc.Service)对象，并执行其start()方法。 初始化过程中将 加载 neutron.agent.l3.agent.L3NATAgentWithStateReport 类以及设置一些配置参数。
+   
+   //step 1.2 中 class Service(n_rpc.Service) start 方法逻辑：
+		1.2.1 初始化 rpc connection，并创建消费者线程 消费 rpc topic。
+		1.2.2 创建loop任务周期性调用report_state方法上报 l3-agent 服务的状态
+		1.2.3 创建loop周期性的任务调用 neutron.agent.l3.agent.L3NATAgentWithStateReport 中的 periodic_sync_routers_task 方法从北向neutron-server fullsync 当前host上的所有的router_ids。
+		1.2.4 调用neutron.agent.l3.agent.L3NATAgentWithStateReport 中的after_start 方法处理router loop
+		
+		//上述步骤 1.2.3 中 fullsync routers处理过程：
+			初始化 namespace_manager(neutron.agent.l3.namespace_manager.py)实例对象。该实例对象主要是l3 的router namespace，dvr_snat_ns 以及 dvr_fip_ns 进行管理。如清除ns操作等。
+			通过plugin_rpc 调用get_router_ids方法从北向获取当前host上的router_ids。
+			通过plugin_rpc 调用get_routers方法批量地（一次取sync_routers_chunk_size 个router）从北向获取当前host上的所有routers。
+			轮训 routers，处理router:
+				将router_id 加入到router namespace中的标记队列，使其在清除ns时不清楚 router的ns
+				如果router 为分布式路由：
+					如果router 存在ext_net_id（即external_gateway_info属性中的network_id字段存在），将router的fip_ns加入到router namespace中的标记队列中。
+					如果router 不存在ext_net_id，且l3 agent配置为dvr_snat 模式，则namespace管理器清除router的 snat namespace。
+				如果router为HA router：
+					检测router的状态是否与db状态一致，如果不一致，发送router状态变化通知。
+				构建RouterUpdate对象，加入到RouterProcessingQueue 的优先级队列Queue.PriorityQueue中等待处理。RouterUpdate构建参数：
+					queue.RouterUpdate(
+							r['id'],
+							queue.PRIORITY_SYNC_ROUTERS_TASK,
+							router=r,
+							timestamp=timestamp)   // 不设置action
+				设置fullsync = False
+				调整sync_routers_chunk_size 的值
+				将当前router_info中不在北向获取routers中的router 构建RouterUpdate对象，加入到RouterProcessingQueue中等待处理。RouterUpdate构建参数：
+					queue.RouterUpdate(router_id,
+							queue.PRIORITY_SYNC_ROUTERS_TASK,
+							timestamp=timestamp,
+							action=queue.DELETE_ROUTER)	 // 设置action				
+					
+		// 上述步骤 1.2.4 中 after_start()处理逻辑
+			(a)启动一个协程池调用 _process_routers_loop 方法轮询处理router。处理router的方法为_process_router_update：
+				按顺序从RouterProcessingQueue 的优先级队列Queue.PriorityQueue中取出RouterUpdate对象。
+					if update.action == queue.PD_UPDATE:  
+						//Processing IPv6 PD Prefix Update,and continue
+					if update.action == queue.DELETE_ROUTER 且最后的更新时间小于router的timstamp：
+						// 将router_id 从内存中保存router更新时间的self.last_update_time字典中删除
+					if update.action == queue.CREATE_DISTRIBUTED_DHCP：
+						if update.id in self.router_info：
+							// continue。此时处理极端情况，当路由更新时，distributed_dhcp_notify 被接受到
+						如果从内存中保存的_prefetched_routers能够获取到router：
+							将updateRouter中的prefetched_network 保存到router的prefetched_networks属性中
+					if update.action != queue.DELETE_ROUTER and not router:
+						通过router_id 从北向获取router，获取不到，返回异常。
+						if update.action == queue.CREATE_DISTRIBUTED_DHCP：
+							将updateRouter中的prefetched_network 保存到router的prefetched_networks属性中，并将router_id保存到内存中的_prefetched_routers字典中
+					if not router and update.action != queue.DELETE_ROUTER and update.id in self._prefetched_routers
+						// continue. Avoid removing prefetched router
+					if not router:
+						将router_id从内存中的_prefetched_routers 字典中删除
+						安全删除router：
+							通过router_id从router_info中获取当前router的router_info
+							通过namespace_manager 删除router的namespace
+							发送 router before_delete消息
+							将router的router_info信息从router_info中删除
+							发送 router after_delete消息
+						l3_agent_extensions_manager 调用配置文件中的三层agent扩展驱动(driver)调用自身的delete_router方法删除router
+						更新router的timestamp，使其在processing queue队列中变为 older events，防止删除的router重新创建。
+						将router_id从内存中的 _fetched_router_ids 字典中删除。
+					处理兼容的路由：（_process_router_if_compatible）
+						if not self.conf.enable_inat_enat:
+							创建agent gw port（floating ip gw port）。检测gw port是否存在，不存在进行创建：
+								创建fip namespace(fip-${net-id})
+								通过rpc_plugin从北向neutron-server获取agent_gateway_port
+								创建fip namespace：
+									ip netns add ${fip_namespace}
+									ip netns exec ${fip_namespace} ip link set lo up
+									ip netns exec ${fip_namespace} sysctl -w net.ipv4.ip_forward=1
+									ip netns exec ${fip_namespace} sysctl -w net.ipv4.conf.all.rp_filter=0
+									ip netns exec ${fip_namespace} sysctl -w net.ipv4.conf.default.rp_filter=0
+								获取fg_interface_name(fg-${port_id前11位})
+								增加fip agent gateway：
+									如果fip namespace中不存在 fg_interface_name，ovs创建该port。调用 interface_driver(neutron.agent.linux.interface.OVSInterfaceDriver) plug该接口(处理过程在dhcp agent分析过)
+									fip namespace中初始化路由port. 调用interface_driver(neutron.agent.linux.interface.OVSInterfaceDriver) init_router_port 方法。
+									在fip namespace中对agent_gateway_port 的每个fixip 执行garp：
+										 python ${python_site_package_dir}/neutron/agent/l3/send_arping.py ${fg_interface_name} ${fixip} ${agent_gateway_port_mac} 1
+									在fip namespace中的fg_interface_name 接口上增加 agent_gateway_port的gw ip：
+										ip netns exec ${fip_namespace} ip route replace default via ${gateway_ip}
+										ip netns exec ${fip_namespace} sysctl -w net.ipv4.conf.${fg_interface_name}.proxy_arp=1
+								清除fg namespace 无用的port（lo接口除外）
+								fip ns 初始化完成		
+						if 	router.get("prefetched_networks"): //router 中包含 prefetched_networks属性
+							// 调用_process_prefetched_router 方法在路由中添加 prefetched_networks 路由信息
+									
+						如果 router 不在 router_info中：
+							// 增加router
+								从router_info中获取router
+								调用router_info中的process()方法对router进行处理（router处理的核心逻辑。详细走读下期分解）
+								发送router的 after_create 通知
+								调用l3_ext_manager 中配置的driver的 add_router方法处理l3 扩展功能
+						否则：
+							// 更新router
+								从router_info中获取router
+								发送router的 before_update 通知
+								调用router_info中的process()方法对router进行处理（router处理的核心逻辑。详细走读下期分解）
+								发送router的 after_update 通知
+								调用l3_ext_manager 中配置的driver的 add_router方法处理l3 扩展功能
+				    更新routerProcess中RouterUpdate 的timestamp
+					+------------------end 完成单个RouterUpdate的处理---------------------------------+
+					
+			(b) 启动一个协程池调用 _send_router_interface_garp 方法三分钟一次轮询处理，向router 发送garp。 对每个router中的每个qr port发送arp。
+				在router的namespace(qrouter-${router_id})执行命令： python ${python_site_package_dir}/neutron/agent/l3/send_arping.py  ${gw_device_name} fa:fa:fa:fa:fa:fa ${qr_fixip} ${count}
+
+### 4 ##
+neutron-metadata-agent 初始化流表过程
+/usr/bin/neutron-metadata-agent --config-file=/etc/neutron/neutron_metadata.conf --config-file=/etc/neutron/metadata_agent.ini
+
+/usr/bin/neutron-metadata-agent 调用neutron.agent.metadata_agent.py中的main方法
+
++------------------------------------------------------------------------------------+ 
+(一) neutron-metadata-agent  初始化过程：
++------------------------------------------------------------------------------------+ 
+
+
+(1) neutron.agent.metadata_agent.py中的main方法执行逻辑
+	1.1.设置配置参数
+	1.2.开启一个monitor线程，定时向monitor_file_dir 写入当前时间来检查服务是否hung住
+	1.3.初始化一个UnixDomainMetadataProxy实例启动一个unixDomain proxy WSGIServer服务，即 neutron-metadata-agent 进程服务，并调用wait()方法等待请求进行处理。WSGIServer服务的application 为
+		实现了_proxy_request方法的MetadataProxyHandler实例。WSGIServer 启动时调用MetadataProxyHandler的 __call__方法来proxy http request。处理request的逻辑：
+			(a) 通过request中请求头里的 'X-Forwarded-For'(vm实例的fixed_ip), 'X-Neutron-Network-ID'(vm实例所在network的net-id) 和 'X-Neutron-Router-ID'（vm实例所在router的router-id）调用 MetadataPluginAPI
+			(b) 插件向neutron-server发送rpc 消息请求ports信息。如果返回的ports数量为多个，则响应请求并返回HTTPNotFound错误。
+			(c)如果ports数量为1即返回单个port（一般同一network中的fixed_ip是不重复的），代理http request：
+				重新构造request向nova_metadata服务发送http request获取 metadata响应并返回。此时请求头headers有：'X-Forwarded-For': req.headers.get('X-Forwarded-For'), 'X-Instance-ID': instance_id,
+				'X-Tenant-ID': tenant_id, 'X-Instance-ID-Signature': self._sign_instance_id(instance_id)
+		
+	tips： 启动UnixDomainMetadataProxy 服务是会配置一个	CONF.metadata_proxy_socket 文件来监听本地unix socket 。
+
