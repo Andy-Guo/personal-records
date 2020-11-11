@@ -1,0 +1,472 @@
+#### 6 ###
+neutron-ovs-agent 初始化过程
+/usr/bin/neutron-openvswitch-agent --config-file=/etc/neutron/neutron_ovs.conf --config-file=/etc/neutron/plugins/openvswitch/ovs_neutron_plugin.ini
+
+创建br-int，初始化流表
+setup agent rpc
+创建br-phy, 初始化流表
+初始化LocalVlanManager
+初始化br-tun，初始化流表
+初始化external manager
+初始化dvr agent 并初始化dvr flows
+创建辅助网桥
+存储local vlan map
+创建sg agent rpc，并注册notify 回调函数
+安全组agent提供 arp proof protection
+agent启动heatbeat 上报agent status_p
+轮训agent topic comsumer threads
+
+
+2 metadata agent启动过程
+/usr/bin/neutron-metadata-agent --config-file=/etc/neutron/neutron_metadata.conf --config-file=/etc/neutron/metadata_agent.ini
+
+ref：https://zhuanlan.zhihu.com/p/38774639
+
+3 dhcp agent
+ /usr/bin/neutron-dhcp-agent --config-file=/etc/neutron/neutron_dhcp.conf --config-file=/etc/neutron/dhcp_agent.ini
+
+ref：https://blog.csdn.net/gj19890923/article/details/51501082
+
+4 l3 agent
+/usr/bin/neutron-l3-agent --config-file=/etc/neutron/neutron_dvr_compute.conf --config-file=/etc/neutron/dvr_compute_agent.ini
+
+ref: https://www.jianshu.com/p/ab85ff312521
+
++----------------------------+
+        self.agent_state = {
+            'binary': 'neutron-openvswitch-agent',
+            'host': host,
+            'topic': n_const.L2_AGENT_TOPIC,
+            'configurations': {'bridge_mappings': 			self.bridge_mappings,
+                               'tunnel_types': 				self.tunnel_types,
+                               'tunneling_ip': 				self.local_ip,
+                               'l2_population': 			self.l2_pop,
+                               'arp_responder_enabled':   	self.arp_responder_enabled,
+                               'enable_distributed_routing':self.enable_distributed_routing,
+                               'log_agent_heartbeats':      agent_conf.log_agent_heartbeats,
+                               'extensions': 				self.ext_manager.names(),
+                               'datapath_type': 			ovs_conf.datapath_type,
+                               'ovs_capabilities': 			self.ovs.capabilities,
+                               'vhostuser_socket_dir':      ovs_conf.vhostuser_socket_dir,
+							   'devices':					self.int_br_device_count,					[optins]
+							   'in_distributed_mode':		self.dvr_agent.in_distributed_mode(),		[optins]
+                               portbindings.OVS_HYBRID_PLUG: hybrid_plug},
+            'resource_versions': resources.LOCAL_RESOURCE_VERSIONS,
+            'agent_type': agent_conf.agent_type,
+            'start_flag': True}
+			
+openvswitch agent是否需要update的条件:
+	sync or
+	devices_need_retry = true（即failed_devices不为空 或 failed_ancillary_devices 不为空 或 ports_not_ready_yet 不为空）
+    def _agent_has_updates(self, polling_manager):
+        return (polling_manager.is_polling_required or
+                self.updated_ports or
+                self.deleted_ports or
+                self.deactivated_bindings or
+                self.activated_bindings or
+                self.sg_agent.firewall_refresh_needed())				
+    def firewall_refresh_needed(self):
+        return self.global_refresh_firewall or self.devices_to_refilter // 当global_refresh_firewall=true(只有当firewall初始化失败的时候才会设置为true)
+																		或 self.devices_to_refilter>0(值为set,当更新安全组rule或members时，会将port增加到该set中)
++----------------------------+
+
++----------------------------+
+dhcp cmd
++----------------------------+
+dhcp-agent rpc 通知neutron 创建port 并返回元数据信息
+network json:
+{
+  "network": {
+    "status": "ACTIVE",
+    "subnets": [
+      "639583b7-78fa-4e8c-88f6-b0be1adb9b4e"
+    ],
+    "name": "external_om",
+    "provider:physical_network": "physnet1",
+    "admin_state_up": true,
+    "tenant_id": "7e70d5d69d804c82b575ef5bf158a769",
+    "extra_dhcp_opts": [
+      
+    ],
+    "provider:network_type": "vlan",
+    "router:external": false,
+    "shared": false,
+    "port_security_enabled": true,
+    "id": "cd820ab8-e772-46f0-be5b-69035772b09d",
+    "provider:segmentation_id": 1353
+  }
+}
+subnet json:
+{
+  "subnet": {
+    "name": "external_om",
+    "enable_dhcp": true,
+    "network_id": "cd820ab8-e772-46f0-be5b-69035772b09d",
+    "tenant_id": "7e70d5d69d804c82b575ef5bf158a769",
+    "dns_nameservers": [
+      
+    ],
+    "gateway_ip": "4.13.53.1",
+    "ipv6_ra_mode": null,
+    "allocation_pools": [
+      {
+        "start": "4.13.53.2",
+        "end": "4.13.53.30"
+      }
+    ],
+    "host_routes": [
+      
+    ],
+    "ip_version": 4,
+    "ipv6_address_mode": null,
+    "cidr": "4.13.53.0/24",
+    "id": "639583b7-78fa-4e8c-88f6-b0be1adb9b4e"
+  }
+}
+
+
+interface_driver: neutron.agent.linux.interface.OVSInterfaceDriver
+dhcp_driver = neutron.agent.linux.dhcp.Dnsmasq
+dhcp_confs = /var/lib/neutron/dhcp
+DhcpAgent(neutron.agent.dhcp.agent.py)的rpc_plugin(DeviceManager中的plugin): DhcpPluginApi
+NetworkCache: # cache = {dhcp.NetModel({"id": net-id; "subnets": []; "ports": []}), ......}; subnet_lookup = {}; port_lookup = {}
+self._metadata_routers = {}  # {network_id: router_id}
+
+neutron/agent/linux/dhcp.py #Dnsmasq enable 启动dhcp的过程
+	// 判断dhcp目录是否存在（/var/lib/neutron/dhcp）
+	// neutron/agent/linux/dhcp.py  #DeviceManager setup(network) 返回dhcp_port的interface_name
+	    初始化创建dhcp_port元数据信息：
+	      生成dhcp port的device_id：dhcp${host_uuid}-${network_id} 如：dhcp36195b25-dbd6-5aba-b25a-b5654b59e96a-6a0cb01b-4a66-4e60-bdbf-dda9d5f620ac
+		  获取network中enable dhcp的subnets
+		  if interface_driver设置了use_gateway_ips；
+		     每个子网需要为dhcp_port分配一个fixIp
+		  通过DhcpAgent中的rpc_plugin调用create_dhcp_port 方法北向发送rpc请求，通过neutronManager调用Core-plugin的create_port方法创建dhcp_port并返回dhcp_port信息到agent侧。
+		  设置dhcp_port的fixed_ips
+		  更新从北向获取的network object的ports中dhcp_port信息
+	    获取dhcp_port的网卡名interface_name: tap + ${port_id} 取前14位长度的字符。如tap2218e17f-9a。
+	    在dhcp的namespace中检查dhcp_port网卡是否存在。 执行ip netns exec dhcp-6a0cb01b-4a66-4e60-bdbf-dda9d5f620ac ip link set ${interface_name} up 命令，如报异常，则不存在，需要创建。
+	    如dhcp_port网卡不存在，创建dhcp_port网卡并up 网卡：
+	       判断网卡设备是否存在。执行 ip netns exec  dhcp-6a0cb01b-4a66-4e60-bdbf-dda9d5f620ac ip -o link show ${interface_name},判断返回结果中是否包含 link/ether 属性。 
+	       如果存在，将网卡up起来；如果不存在，创建该网卡：
+				self.check_bridge_exists(bridge): ip -o link br-int
+				获取tap_name:
+				    如果self.conf.ovs_use_veth = true；tap_name 为将interface_name使用 "ns-"前缀替换 "tap"前缀。否则 tap_name = interface_name	       
+				self._ovs_add_port(bridge, tap_name, port_id, mac_address,internal=internal) #先删除然后在创建ofport，然后在设置属性
+					ovs-vsctl --may-exist del-port bridge tap_name
+					ovs-vsctl --may-exist add-port bridge tap_name 
+					ovs-vsctl -- set Interface tap_name external_ids:iface-id=port_id external_ids:iface-status=active external_ids:attached-mac=mac_address external_ids:internal=false
+				设置mac地址
+					ip netns exec dhcp-6a0cb01b-4a66-4e60-bdbf-dda9d5f620ac ip link set tap_name address mac_address
+				如果非veth模式，确定namespace是否存在。执行ip -o netns list 返回结果中看是否与namespace 同名的行。如有，则存在，否则创建namespace：
+					ip netns add dhcp-6a0cb01b-4a66-4e60-bdbf-dda9d5f620ac
+					ip netns exec dhcp-6a0cb01b-4a66-4e60-bdbf-dda9d5f620ac sysctl -w net.ipv4.conf.all.promote_secondaries=1
+					ip netns exec dhcp-6a0cb01b-4a66-4e60-bdbf-dda9d5f620ac ip link set lo up
+					将网卡添加到namespace中：
+					ip set tap2218e17f-9a netns dhcp-6a0cb01b-4a66-4e60-bdbf-dda9d5f620ac
+				设置mtu
+					ip link netns exec dhcp-cd820ab8-e772-46f0-be5b-69035772b09d ip link set tap_name 1600
+				将网卡up起来:
+					ip netns exec dhcp-cd820ab8-e772-46f0-be5b-69035772b09d ip link set tap_name up
+				self.fill_dhcp_udp_checksums(namespace=network.namespace): # 确保dhcp reply包的udp checksum总是正确
+					ip netns exec dhcp-cd820ab8-e772-46f0-be5b-69035772b09d iptalbes --table mangle --insert POSTROUTING -p udp -m udp --dport 68 -j CHECKSUM --checksum-fill
+					ip netns exec dhcp-cd820ab8-e772-46f0-be5b-69035772b09d iptalbes-restore
+					
+       	将dhcp_port的fixedips地址转换为cidr的格式(fixIp/net.prefixlen,如 192.168.0.2/24)；保存到列表变量ip_cidrs中
+		如果self.driver.use_gateway_ips = true； 将network中enable_dhcp=true的子网的网关ip以cidr的格式添加到ip_cidrs中
+		if self.conf.force_metadata or self.conf.enable_isolated_metadata:
+			将metada默认的cidr 169.254.169.254/32 添加到ip_cidr中。
+        interface_driver初始化l3：		
+		    查看网卡现有的ip addrs，保存到previous。 执行  ip netns exec qdhcp-6a0cb01b-4a66-4e60-bdbf-dda9d5f620ac ip addr show  tap1136b328-51 permanent 
+			给网卡增加新的ip addr。将ip_cidr中不在 previous中的ip_cidr 添加到网卡中去：
+			    ip netns exec qdhcp-6a0cb01b-4a66-4e60-bdbf-dda9d5f620ac ip -4(or -6) addr add  ${ip_cidr} brd ${} scope global dev ${tap_name} 
+			清除旧的的ip_cidr：
+			    if  clean_connections = true：# 删除地址以及 conntrack state
+					ip netns exec qdhcp-6a0cb01b-4a66-4e60-bdbf-dda9d5f620ac ip -4(or -6) addr del ${ip_cidr} dev ${tap_name} 
+					ip netns exec qdhcp-6a0cb01b-4a66-4e60-bdbf-dda9d5f620ac ip conntrack -D -d ${ip_cidr} # ingress packages
+					ip netns exec qdhcp-6a0cb01b-4a66-4e60-bdbf-dda9d5f620ac ip conntrack -D -q ${ip_cidr} # egress  packages
+				else:
+					ip netns exec qdhcp-6a0cb01b-4a66-4e60-bdbf-dda9d5f620ac ip -4(or -6) addr del ${ip_cidr} dev ${tap_name} 
+        设置默认路由：
+            获取默认路由的ip_cidr以及路由的metric。执行 ip netns exec qdhcp-6a0cb01b-4a66-4e60-bdbf-dda9d5f620ac ip route list 在返回结果中找到以default 开头的行
+			轮询network的subnets，如果子网的网关不等于namespace获取的默认路由ip_cidr,重新设置dhcp netns的网关。
+				如果获取的默认路由ip_cidr（即gateway） 不在network的subnet中，将当前的ip4和ip6路由中包含该ip_cidr的路由删除。执行如下命令：
+					ip netns exec qdhcp-6a0cb01b-4a66-4e60-bdbf-dda9d5f620ac ip -4(or -6) route list scope link  执行结果返回的router 过滤掉包含 src 字符串的routers
+					如果gateway在返回的routers中，删除该router:
+						ip netns exec qdhcp-6a0cb01b-4a66-4e60-bdbf-dda9d5f620ac ip -4(or -6) route del ${ip_cidr} dev ${tap_name} scope link 
+	            如果subnet的网关不在subnet的cidr内，增加subnet 的gateway 路由：
+					ip netns exec qdhcp-6a0cb01b-4a66-4e60-bdbf-dda9d5f620ac ip -4(or -6) route replace ${subnet.gateway_ip} dev  ${tap_name} scope link 
+		        增加subnet的网关ip_address为路由网关：
+					ip netns exec qdhcp-6a0cb01b-4a66-4e60-bdbf-dda9d5f620ac ip -4(or -6) route replace default via ${subnet.gateway_ip} dev  ${tap_name} 
+	        如果network中无subnet，且ip netns中获取到的默认路由存在，删除路由:
+				ip netns exec qdhcp-6a0cb01b-4a66-4e60-bdbf-dda9d5f620ac ip -4(or -6) route del default via ${ip_cidr}
+		清除network中的stale device网卡,即删除dhcp netns中除dhcp port device的其他网卡,lo 网卡除外：
+			查找netns中所有网卡命令：ip netns exec qdhcp-6a0cb01b-4a66-4e60-bdbf-dda9d5f620ac find /sys/class/net -maxdepth 1 -type l(L的小写) -printf %f
+			ovs从网桥上unplug 网卡： ovs-vsctl --if-exists del-port bridge tap_name
+	// self.spawn_process()			
+	    生成dnsmasq	第一次启动时用到的lease 文件。lease文件在dnsmaq start时通过 --dhcp-leasefile ${leasefile} 进行配置。file格式：epoch-timestamp mac_addr ip_addr hostname client-ID
+		    获取lease文件路径。该文件位于${confs_dir}/${net-id}/lease. 如/etc/neutron/dhcp/${net-id}/lease.
+			获取dhcp lease时间。0表示无限大。可通过dhcp_lease_duration参数配置
+			计算network 中port 的fixIps 对应的 host_tuple(port, alloc, hostname, name, no_dhcp, no_opts),处理后以[timestamp, port.mac_address, ip_address]写入 lease文件中。
+			tips：
+				If a port with v6 extra_dhcp_opts is on a network with IPv4 and IPv6 stateless subnets. IPv4的记录将排在前面。如“
+					fa:16:3e:8f:9d:65,30.0.0.5,set:aabc7d33-4874-429e-9637-436e4232d2cd
+					(entry for IPv4 dhcp)
+					fa:16:3e:8f:9d:65,set:aabc7d33-4874-429e-9637-436e4232d2cd
+					(entry for stateless IPv6 for v6 options)				
+        spawn或reload network的dnsmasq 进程：
+			生成dhcp hostfile 并写入到${confs_dir}/${net-id}/host 文件中。通过--dhcp-hostsfile 选项配置。格式：'mac_address,FQDN,ip_address' 如：
+				（port.mac_address, 'set:', port.id） or (port.mac_address, self._ID, client_id, name,ip_address, 'set:', port.id) or （port.mac_address, self._ID, client_id, name,ip_address）
+				or （port.mac_address, name, ip_address,'set:', port.id） or (port.mac_address, name, ip_address)
+			生成dhcp additional hosts 文件。写入到	${confs_dir}/${net-id}/addn_hosts 文件中。通过 --addn-hosts 选项配置。格式：'alloc.ip_address, fqdn, hostname'	
+			生成dhcp options  文件。写入到	${confs_dir}/${net-id}/ops	文件中。通过 --dhcp-optsfile 选项配置。格式：'alloc.ip_address, fqdn, hostname'
+			启动dnsmasq 服务.在root用户下，执行ip netns exec ${dhcp-namespace} ${cmd}； 将cmd用如下命令替换:
+				dnsmasq --no-hosts --no-resolve [${dnsmasq_dns_servers}] --strict-order --except-interface=lo --pid-file=%s --dhcp-hostsfile=${hostfile_file} --addn-hosts=${addn-hosts_file} 
+				--dhcp-optsfile=${optsfile} --dhcp-leasefile=${dhcp-leasefile} --dhcp-match=set:ipxe,175 [--bind-interfaces --interface=${interface_name}] [--dhcp-range=set:tap${i},${cidr.network}
+				,static,infinite] [--dhcp-option-force=option:mtu,${mtu_value}] --dhcp-lease-max=86400  --conf-file=${config-file} [--server=8.8.8.8 [--server=${server_ip} ...] [--domain=${dhcp_domain}]
+				[--dhcp-broadcast] [--log-queries --log-dhcp --log-facility=${log_file}]
+				or 动态绑定：
+				dnsmasq --no-hosts --no-resolve [${dnsmasq_dns_servers}] --strict-order --except-interface=lo --pid-file=%s --dhcp-hostsfile=${hostfile_file} --addn-hosts=${addn-hosts_file} 
+				--dhcp-optsfile=${optsfile} --dhcp-leasefile=${dhcp-leasefile} --dhcp-match=set:ipxe,175 [--bind-dynamic --interface=${interface_name} --interface=tap* --bridge-interface=${interface_name},tap*]
+				[--dhcp-range=set:tap${i},${cidr.network},static,infinite] [--dhcp-option-force=option:mtu,${mtu_value}] --dhcp-lease-max=86400  --conf-file=${config-file} 
+				[--server=8.8.8.8 [--server=${server_ip} ...] [--domain=${dhcp_domain}] [--dhcp-broadcast] [--log-queries --log-dhcp --log-facility=${log_file}]
+			process_monitor注册 dnsmasq 的process_process 服务。uuid为network的id，服务名称：dnsmasq。monitor_process为启动dnsmasq服务的处理过程。
+
+// dhcp_agent 更新metadata proxy过程。update_isolated_metadata_proxy(network)：
+	通过配置文件中force_metadata，enable_metadata_network，enable_isolated_metadata 配置来决定是否启动还是关闭network的metadata_proxy服务。
+	启动network的metadata_proxy过程：
+		在network中的ports中找到router_ports.如果router_ports为多个，报错终止。如果只有一个router_port，调用 MetadataDriver（neutron.agent.metadata.driver.py）的spawn_monitored_metadata_proxy
+		来enable服务:
+		    1.初始化external_process.ProcessManager实例。该实例的回调方法为_get_metadata_proxy_callback。该方法为启动metadata-proxy 服务的命令行.启动命令行如下：
+				neutron-ns-metadata-proxy --pid_file=${pid-file} --metadata_proxy_socket=${conf.metadata_proxy_socket} --network_id=${net-id} (or --router_id=${router-id}) --state_path=${conf.state_path}
+				--metadata_port=80 [--metadata_proxy_user=${user}] [--metadata_proxy_group=${group}] [--debug] [--verbose] [--log-file={log-file} --log-dir=${log-dir} --nometadata_proxy_watch_log] (or 
+				--use-syslog --syslog-log-facility=${conf.syslog_log_facility})
+				如：
+				/opt/cloud/services/network-agent/venv/bin/python2.7 /bin/neutron-ns-metadata-proxy --pid_file=/var/lib/neutron/external/pids/6a0cb01b-4a66-4e60-bdbf-dda9d5f620ac.pid 
+				--metadata_proxy_socket=/var/lib/neutron/metadata_proxy --network_id=6a0cb01b-4a66-4e60-bdbf-dda9d5f620ac --state_path=/var/lib/neutron --metadata_port=80
+			2.调用ProcessManager实例的enable方法。enable 方法执行逻辑是在namespace中执行启动metadata-proxy 服务的命令行。 ip netns exec ${namespace} ${cmd}
+			3. process_monitor注册 metadata-proxy 服务。uuid为router_id(如果为空则为network_id),服务名称：metadata-proxy。monitor_process为ProcessManager实例。
+		disable服务如果有停止服务的cmd则ProcessManager调用cmd来停止，否则直接通过kill -9 ${pid} 来停止。
+
+### 6 ###
+## neutron server port update action
+
+### neutron server update operation
+  - neutron.api.v2.base.py
+    -
+    ```
+    def update(self, request, id, body=None, **kwargs):
+        """Updates the specified entity's attributes."""
+        try:
+            payload = body.copy()
+        except AttributeError:
+            msg = _("Invalid format: %s") % request.body
+            raise exceptions.BadRequest(resource='body', msg=msg)
+        payload['id'] = id
+        self._notifier.info(request.context,
+                      self._resource + '.update.start',
+                      payload)
+        return self._update(request, id, body, **kwargs)
+    ```
+    - update 方法发送资源更新开始的msg，然后调用_update()方法更新资源。
+    - _update()方法工作：：判断参数的合法性（prepare_request_body，合法性在attributes中定义）
+    -> policy权限检查 -> 调用plugin 的操作方法（create,update,delete,index,show）-> policy过滤需要展示的属性 -> 向其他影响的资源发送消息（notify，send_nova_notification，dhcp_agent_notifier）。调用plugin 方法代码：
+    -
+      ```
+          def _update(self, request, id, body, **kwargs):
+             ...
+             obj_updater = getattr(self._plugin, action)
+             kwargs = {self._resource: body}
+             if parent_id:
+                 kwargs[self._parent_id_name] = parent_id
+             obj = obj_updater(request.context, id, **kwargs)             
+             ...
+      ```
+      getattr 方法获取插件的方法，方法命名规则在__init__()方法的_plugin_handlers中：
+      ```
+          def __init__():
+             ...
+             if parent:
+                 self._parent_id_name = '%s_id' % parent['member_name']
+                 parent_part = '_%s' % parent['member_name']
+             else:
+                 self._parent_id_name = None
+                 parent_part = ''
+             self._plugin_handlers = {
+                 self.LIST: 'get%s_%s' % (parent_part, self._collection),
+                 self.SHOW: 'get%s_%s' % (parent_part, self._resource)
+             }
+             for action in [self.CREATE, self.UPDATE, self.DELETE]:
+                 self._plugin_handlers[action] = '%s%s_%s' % (action, parent_part,
+                                                              self._resource)
+            ...                                                                              
+      ```
+      因为parent为空，所有update方法为update_xxx()格式，xxx为操作的资源名称。
+
+  - plugin 为ML2Plugin
+    - neutron.api.v2.router.py
+      ```
+      class APIRouter(base_wsgi.Router):
+
+          @classmethod
+          def factory(cls, global_config, **local_config):
+              return cls(**local_config)
+
+          def __init__(self, **local_config):
+              mapper = routes_mapper.Mapper()
+              plugin = manager.NeutronManager.get_plugin()
+              ext_mgr = extensions.PluginAwareExtensionManager.get_instance()
+              ext_mgr.extend_resources("2.0", attributes.RESOURCE_ATTRIBUTE_MAP)
+              ......
+      ```
+    - neutron.manager.py中NeutronManager的__init__()方法初始化core plugin：
+      ```
+      def __init__(self, options=None, config_file=None):
+        ......
+        plugin_provider = cfg.CONF.core_plugin
+        LOG.info(_LI("Loading core plugin: %s"), plugin_provider)
+        self.plugin = self._get_plugin_instance(CORE_PLUGINS_NAMESPACE,
+                                                plugin_provider)
+        ......        
+      ```  
+      然后到neutron.conf 中查看core_plugin = neutron.plugins.ml2.plugin.Ml2Plugin
+
+  -     
+
+
+####  7 ######
+neutron 创建net 过程：
+
+	http req: 
+		curl -g -i --cacert "/etc/FSSecurity/cacert/openstack-cli_ca.crt" -X POST https://network.localdomain.com:8020/v2.0/networks.json 
+			-H "User-Agent: python-neutronclient" -H "Content-Type: application/json" 
+			-H "Accept: application/json" -H "X-Auth-Token: {SHA256}b3fa6d13d897219a805549e2af27770f36b60a2875e3f50cc71e1fa71c81c359" 
+			-d '{"network": {"name": "xxx", "admin_state_up": true}}'
+	http resp: 
+		{"network": {"status": "ACTIVE", "subnets": [], "name": "xxx", "provider:physical_network": "physnet1", "admin_state_up": true, "tenant_id": "ee335cc364154a37ab49f03401750549", "provider:network_type": "vlan", "router:external": false, "shared": false, "port_security_enabled": true, "id": "5869eb53-5001-4666-a041-e96ab38ee911", "provider:segmentation_id": 3833}}
+
+
+network 《---》	segmentation
+network provider： 	provider:network_type；provider:physical_network；provider:physical_network
+		
+neturon 创建subnet 过程：
+	http req: 
+		curl -g -i --cacert "/etc/FSSecurity/cacert/openstack-cli_ca.crt" -X POST https://network.localdomain.com:8020/v2.0/subnets.json 
+			-H "User-Agent: python-neutronclient" -H "Content-Type: application/json" 
+			-H "Accept: application/json" -H "X-Auth-Token: {SHA256}da0124e7110b83454401e36020f844097286eab4b28d6a4f31f6728ce463e9e3" 
+			-d '{"subnet": {"network_id": "5869eb53-5001-4666-a041-e96ab38ee911", "ip_version": 4, "cidr": "192.168.0.1/24"}}'
+	http resp:
+		{"subnet": {"name": "", "enable_dhcp": true, "network_id": "5869eb53-5001-4666-a041-e96ab38ee911", "tenant_id": "ee335cc364154a37ab49f03401750549", "dns_nameservers": [], "gateway_ip": "192.168.0.1", "ipv6_ra_mode": null, "allocation_pools": [{"start": "192.168.0.2", "end": "192.168.0.254"}], "host_routes": [], "ip_version": 4, "ipv6_address_mode": null, "cidr": "192.168.0.0/24", "id": "eb5d8035-abbf-4ae1-b9ab-22a829388d52"}}
+
+neutron 创建port 过程：
+	http req:
+		curl -g -i --cacert "/etc/FSSecurity/cacert/openstack-cli_ca.crt" -X POST https://network.localdomain.com:8020/v2.0/ports.json 
+			-H "User-Agent: python-neutronclient" -H "Content-Type: application/json" 
+			-H "Accept: application/json" -H "X-Auth-Token: {SHA256}428e4cd11e987b7a371f362f43e2d8190a815cd381f0134bb884261c637b5310" 
+			-d '{"port": {"network_id": "5869eb53-5001-4666-a041-e96ab38ee911", "admin_state_up": true}}'
+	http resp:
+		{"port": {"status": "DOWN", "binding:host_id": "", "allowed_address_pairs": [], "device_owner": "", "binding:profile": {}, "port_security_enabled": true, "fixed_ips": [{"subnet_id": "eb5d8035-abbf-4ae1-b9ab-22a829388d52", "ip_address": "192.168.0.66"}], "id": "78a4bc46-9ff8-40ca-823c-ebb25138925d", "security_groups": ["1676d183-0c72-4e0d-af77-1f386a2054b0"], "device_id": "", "name": "", "admin_state_up": true, "network_id": "5869eb53-5001-4666-a041-e96ab38ee911", "tenant_id": "ee335cc364154a37ab49f03401750549", "binding:vif_details": {}, "binding:vnic_type": "normal", "binding:vif_type": "unbound", "mac_address": "fa:16:3e:01:28:91"}}
+
+
+ su gaussdba  gsql NEUTRON -W FusionSphere123 
+ML2 调用过程：
+
+type_drivers = local,flat,vlan,gre,vxlan,geneve
+mechanism_drivers = openvswitch,cascading,vlb,vip,eip,sriovnicswitch（级联） ；openvswitch,l2population_v2,vip（被级联）
+extension_drivers = cascading_qos = networking_cascading.qos.qos_extension_driver:QosExtensionDriver
+firewall_driver = neutron.agent.linux.iptables_firewall.OVSHybridIptablesFirewallDriver
+
++--------------------------------+
+create_network：
++--------------------------------+
+create_network_in_db
+extension_manager.process_create_network
+type_manager.create_network_segments
+mechanism_manager.create_network_precommit
+db commit
+mechanism_manager.create_network_postcommit
+graph TD
+    A[CREATE NETWORK] --> B(create_network_in_db)
+    B --> C(extension_manager.process_create_network)
+    C --> D(type_manager.create_network_segments)
+    D --> E(mechanism_manager.create_network_precommit)  (找到plugin的代码路径)
+    E --> F(commit_network_to_db)
+    F --> G(mechanism_manager.create_network_postcommit)
+	
+创建网络数据库的变化：
+	1 在network 表增加记录。 select * from NETWORKS limit 1;
+	2 select * from NetExtraDhcpOpt;
+	3 NETWORKSECURITYBINDINGS
+	4 NETEXTRADHCPOPTS
+	5 select * from ML2_NETWORK_SEGMENTS;
+	
++--------------------------------+
+create_subnet：
++--------------------------------+
+create_subnet_in_db
+extension_manager.process_create_subnet
+mechanism_manager.create_subnet_precommit
+db commit
+mechanism_manager.create_subnet_postcommit
+graph TD
+    A[CREATE SUBNET] --> B(create_subnet_in_db)
+    B --> C(extension_manager.process_create_subnet)
+    C --> D(mechanism_manager.create_subnet_precommit)  
+	       (_prepare_dhcp_port) #distributed_dhcp   -> create distributed_dhcp_port
+    D --> E(commit_subnet_to_db)
+    E --> F(mechanism_manager.create_subnet_postcommit)
+	
+创建subnet db：
+	1 SUBNETS
+	2 DNSNAMESERVERS
+	3 SUBNETROUTES 
+	4 IPALLOCATIONPOOLS 
+	5 IPAVAILABILITYRANGES 
+	
+ select * from ports where network_id='681e5c9d-6744-43a0-8e73-b1af22551680' and DEVICE_OWNER = 'network:dhcp';
++--------------------------------+
+create_port
++--------------------------------+
+create_port_in_db
+extension_manager.process_create_port
+port biding
+mechanism_manager.create_port_precommit
+db commit
+mechanism_manager.create_port_postcommit
+graph TD
+    A[CREATE PORT] --> B(create_port_in_db)
+    B --> C(extension_manager.process_create_port)
+    C --> D(port_biding)
+    D --> E(mechanism_manager.create_port_precommit)
+    E --> F(commit_port_to_db)
+    F --> G(mechanism_manager.create_port_postcommit)
+
+//-----------	mechanism_manager 管理的方法 在不同厂商的driver中有具体实现 ------
+ACTION_RESOURCE_precommit 和 ACTION_RESOURCE_postcommit方法功能参见openstack官方说明：https://wiki.openstack.org/wiki/Neutron/ML2
+以Arista Mechanism Driver （https://wiki.openstack.org/wiki/Arista-neutron-ml2-driver）为例，其ACTION_RESOURCE_postcommit 方法的实现
+在https://github.com/openstack/networking-arista/blob/master/networking_arista/ml2/mechanism_arista.py中有实现。
+
+router_info:
+        self.router_id = router_id
+        self.ex_gw_port = None
+        self._snat_enabled = None
+        self.fip_map = {}
+        self.internal_ports = []
+        self.floating_ips = set()
+		self.router = router
+        self.use_ipv6 = use_ipv6
+        self.router_namespace = ns
+        self.ns_name = ns.name
+		self.available_mark_id(1024,2048)
+		self._address_scope_to_mark_id = {'noscope': num} 
+		self.iptables_manager = iptables_manager.IptablesManager
+        self.routes = []
+        self.agent_conf = agent_conf
+        self.driver = interface_driver
+        # radvd is a neutron.agent.linux.ra.DaemonMonitor
+        self.radvd = None		
+		
+periodic_sync_routers_task:
+	self.fullsync = boolean
+    _fetched_router_ids = set()	
+	_initialized = boolean   //br-int is initialized 执行cmd: ovs-vsctl -- set Bridge br-int external-ids:l3-initialized=True
+	 self.router_info = {}
