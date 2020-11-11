@@ -1,1 +1,316 @@
 
+
+### 5 ####
+neutron-ovs-agent 初始化流表过程
+ref:https://zpzhou.com/archives/neutron_ovs_agent_study.html
+
+说明：
+1  bridges 类型包含: br-int, br-phys, br-tun, br-ply,  br-router
+	不同网桥对于的类：
+			bridge_classes = {
+				'br_int': _make_br_cls(br_int.OVSIntegrationBridge),
+				'br_phys': _make_br_cls(br_phys.OVSPhysicalBridge),
+				'br_tun': _make_br_cls(br_tun.OVSTunnelBridge),
+				'br_ply': _make_br_cls(br_ply.OVSPolicyBridge),
+				'br_router': _make_br_cls(br_router.OVSRouterBridge),
+			}
+2  "//" 为neutron-ovs-agent 初始化过程的一个step步骤标记		
+
++------------------------------------------------------------------------------------+ 
+(一) neutron-ovs-agent 初始化过程：
++------------------------------------------------------------------------------------+ 
+
+// init br-int
+	创建网桥
+		ovs-vsctl -- --may-exist add-br BRIDGE_NAME [-- set Bridge br-int datapath_type=vxlan]
+		or  ovs-vsctl -- --may-exist add-br BRIDGE_NAME [-- set Bridge br-int datapath_type=vxlan other_config:fwd_mode=openflow]  "dpdk mod"
+	设置网桥 secure 模式
+		ovs-vsctl set-fail-mode br-int secure
+	添加 controller
+		ovs-vsctl set Bridge br-int protocols=OpenFlow10,OpenFlow13
+		
+		ovs-vsctl set br br-int controller=@newcontrol
+		ovs-vsctl --  --id@newcontrol create controller target=tcp\\:127.0.0.1\\:6633 inactivity_probe=120000 connection_mode=out-of-band
+		or [ovs-vsctl set controller br-int target=tcp:127.0.0.1:6633 inactivity_probe=120000 connection_mode=out-of-band]
+
+	清空网桥流表
+		ovs-ofctl del-flows br-int 
+		or ovs-ofctl --strict del-flows br-int [cookie=xxx, priority=1,...]	
+
+	初始化br-int 默认流表（通过openflow协议下发23[CANARY_TABLE],24[ARP_SPOOF_TABLE]号表的msg）
+		 table=23, n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=0 actions=drop
+		 table=24, n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=0 actions=drop
+
+//ovs_neutron_agent初始化rpc	
+    单级联架构：初始化 rpc_proxy
+    级联和被级联架构：初始化state_rpc，	plugin_rpc，sg_plugin_rpc，dvr_plugin_rpc 创建consumer订阅topics=q-agent-notifier的msg
+	     订阅的消息notify有port，tunnel，network的update和delete；sg，qos，L2POPULATION 的update
+		 
+//Setup the physical network bridges. 即 brcps
+	创建br-cps 网桥
+		 ovs-vsctl -- --may-exist add-br brcps [-- set Bridge br-int datapath_type=system]	
+	if drop_flow_on_start = true,清空流表
+		 ovs-ofctl del-flows br-int 
+	初始化默认流表
+		table=0, n_packets=0, n_bytes=0, idle_age=0, hard_age=65534, priority=0 actions=NORMAL	
+	初始化与br-int的veth/patches
+		int-brcps	phy-brcps
+		获取br-int上 int-brcps的接口type： ovs-vsctl get Interface int-brcps type
+	判断是否use_veth_interconnection
+		true：
+			br-int delete int-brcps; brcps 删除phy-brcps
+			在默认namespace创建int-brcps,phy-brcps 两个veth peer.创建命令：在namespace中执行 ip link add int-brcps type veth peer name phy-brcps
+			在br-int上创建int-brcps;在br-cps 上创建phy-brcps
+			[ip netns exec ns-name]ip link set int-brcps up
+			[ip netns exec ns-name]ip link set int-brcps mtu 1600
+			[ip netns exec ns-name]ip link set phy-brcps up
+			[ip netns exec ns-name]ip link set phy-brcps mtu 1600
+		false:
+			如果启用dpdk：
+				创建 br_dpdk_linux 网桥：brctl addbr br_dpdk_linux
+				brctl setfd br_dpdk_linux 0
+				brctl stp br_dpdk_linux off
+				sysctl -w net.ipv6.conf.%s.disable_ipv6=1 % ("br_dpdk_linux")
+				ip link set br_dpdk_linux up
+				如果br-int存在int-brcps，且type为patch，删除int-brcps重建，返回ofport id。
+					 重建命令cmd：ovs-vsctl -- --may-exist add-port br-int int-brcps
+								  ovs-vsctl set Interface int-brcps type=internal
+				如果br-cps中存在phy-brcps，如上br-int操作			
+				在bridge br_dpdk_linux中添加int-brcps,phy-brcps. brctl addif br_dpdk_linux {interface}
+			如果不启用dpdk：
+				如果int-brcps type 为veth，删除	int-brcps,phy-brcps			
+				创建patch port int-brcps,phy-brcps。
+				ovs-vsctl --may-exist add-port br-int int-brcps -- set Interface int-brcps type=patch options:peer=nonexistent-peer
+				ovs-vsctl --may-exist add-port br-cps phy-brcps -- set Interface phy-brcps type=patch options:peer=nonexistent-peer
+				ovs-vsctl set br-int Interface int-brcps options={"peer": phy-brcps}
+				ovs-vsctl set br-cps Interface phy-brcps options={"peer": int-brcps}
+	br-int 设置关于int-brcps网口上的 drop flows； br-cps上设置关于phy-brcps网口上的 drop flows。
+		br-int:
+		table=0, n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=2,in_port=1[int-brcps ofport id] actions=drop
+		br-cps:
+		table=0, n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=2,in_port=4[phy-brcps ofport id] actions=drop
+
+//初始化LocalVlanManager
+
+//初始化 br-tunnel
+    self.tun_br.create(secure_mode=True)
+    self.tun_br.setup_controllers(self.conf)
+	br-int 上创建patch-tun 设置对端为br-tun上的patch-int 
+	ovs-vsctl --may-exist add-port br-int patch-tun -- set Interface patch-tun type=patch options:peer=patch-int
+    br-tun上创建patch-int
+	ovs-vsctl --may-exist add-port br-int patch-int -- set Interface patch-int type=patch options:peer=patch-tun
+	删除br-tun上的flows
+	
+
+//初始化ext_manager。包括 vpc,vpc_v2,bum,baremetal,vip,qos,flowlog,policy
+
+//初始化OVSDVRNeutronAgent 实例
+
+//如果启动enable_ipv6
+    ovs-appctl dpif-dpdk/ipv6_switch enable
+//如果启动enable_ifp_v6，初始化ifp config：
+    ovs-appctl dpif-dpdk/component load arp;ovs-appctl dpif-dpdk/component load route; ovs-appctl dpif-dpdk/component load ifp;
+	ovs-appctl ext/route/create table_index=1 type=hash_ipv6 
+    ovs-appctl ext/route/local-ip/set {local_ip}
+
+//初始化br-tun流表
+    默认流表：
+	enable_distributed_routing 默认流表：
+	  true
+	    table=0[LOCAL_SWITCHING table], n_packets=0, n_bytes=0, idle_age=10, hard_age=65534, priority=2,in_port=1(patch-int-ofport) actions=resubmit(,1[dvr_process table])
+	  false:
+	    table=0, n_packets=0, n_bytes=0, idle_age=10, hard_age=65534, priority=2,in_port=1(patch-int-ofport) actions=resubmit(,2[PATCH_LV_TO_TUN table])
+    默认drop表
+      table=0, n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=0 actions=drop	
+    arp_responder_enabled = true：
+      table=21 [ARP_RESPONDER table], n_packets=0, n_bytes=0, idle_age=10, hard_age=65534, priority=0, actions=resubmit(,22[FLOOD_TO_TUN table]) 
+      table=2[PATCH_LV_TO_TUN table], n_packets=0, n_bytes=0, idle_age=10, hard_age=65534, priority=1, arp,dl_dst= "ff:ff:ff:ff:ff:ff", actions=resubmit(,21 [ARP_RESPONDER table])	  
+      table=29[QR_ARP_RESPONDER table], n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=0,arp actions=IN_PORT
+	table=2[PATCH_LV_TO_TUN table], n_packets=0, n_bytes=0, idle_age=6652, hard_age=65534, priority=0,dl_dst=00:00:00:00:00:00/01:00:00:00:00:00 actions=resubmit(,20[ucast_to_tun table])
+	table=2[PATCH_LV_TO_TUN table], n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=0,dl_dst=01:00:00:00:00:00/01:00:00:00:00:00 actions=resubmit(,22[flood_to_tun table])
+	tunnel type drop 流表(vxlan[table 4], gre[table 3], geneve[table 6]):
+	  table=4, n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=0 actions=drop
+    offline_switch_on = true.增加table 10(LEARN_FROM_TUN table) 学习learn table。 next table：table 20[UCAST_TO_TUN table]
+	enable_bum=true:
+	  table=20[UCAST_TO_TUN table], n_packets=0, n_bytes=0, idle_age=7630, hard_age=65534, priority=0 actions=drop
+	enable_bum=false:  
+	  table=20[UCAST_TO_TUN table], n_packets=0, n_bytes=0, idle_age=7630, hard_age=65534, priority=0 actions=resubmit(,22[FLOOD_TO_TUN table])
+	table=22[FLOOD_TO_TUN table], n_packets=0, n_bytes=0, idle_age=18, hard_age=65534, priority=0 actions=drop
+	
+	如果vpc_v2_extension_driver中 enable_vpc_v2 = false,需要 install_inat_enat_flows：
+       inat: table=0, n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=100,in_port=1[patch-int-ofport],dl_dst=fa:01:00:00:00:02[inat_vtep_mac] actions=load:0xac1c0002[inat_vtep_ip]->NXM_NX_TUN_IPV4_DST[],mod_dl_src:fa:16:3f:87:f4:61[dvr_base_mac],output:2[vtp_ofport]
+       enat: table=0, n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=100,in_port=1[patch-int-ofport],dl_dst=fa:01:00:00:00:03[enat_vtep_mac] actions=load:0xac1c0003[enat_vtep_ip]->NXM_NX_TUN_IPV4_DST[],mod_dl_src:fa:16:3f:87:f4:61[dvr_base_mac],output:2[vtp_ofport]
+    如果enable_ifp_v6 = true：
+	   table=2[PATCH_LV_TO_TUN], n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=6,dl_type=ipv6 dl_dst=01:00:00:00:00:00/01:00:00:00:00:00 actions=drop
+	   table=2[PATCH_LV_TO_TUN], n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=6,dl_type=ipv6 icmpv6 icmpv6.ND_NEIGHBOR_ADVERT ipv6_nd_target=ipv6_nd_target actions=drop
+	 
+//dvr agent setup flows
+    br-int:
+	   install_drop: table=1[DVR_TO_SRC_MAC], n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=1 actions=drop
+	   install_normal: table=0[LOCAL_SWITCHING], n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=1 actions=NORMAL
+	   install_output: table=2[DVR_NO_FLOOD], n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=1 actions=output:2[patch-tun-ofport]
+       install_dvr_no_flood_normal_flow: table=2[DVR_NO_FLOOD], n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=4,arp actions=mod_vlan_vid:0,NORMAL
+	   if enable_vpc_v2 = true
+	      add_dvr_mac_tun_fuzzy: table=0, n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=2,in_port=2(patch-tun-ofport),dl_src=fa:16:3f:00:00:00(dvr_mac_address)/ff:ff:ff:00:00:00 actions=resubmit(,1[DVR_TO_SRC_MAC])
+	   install_dvr_acceleration_flows:
+	   table=0, n_packets=0, n_bytes=0, idle_age=11999, hard_age=65534, priority=20,ip,metadata=0 actions=load:0x1->OXM_OF_METADATA[],resubmit(,30[DVR_L2_TABLE]) 
+       table=0, n_packets=0, n_bytes=0, idle_age=11999, hard_age=65534, priority=20,ipv6,metadata=0 actions=load:0x1->OXM_OF_METADATA[],resubmit(,30[DVR_L2_TABLE])	  
+       table=30[DVR_L2_TABLE], n_packets=8, n_bytes=656, idle_age=12397, hard_age=65534, priority=1 actions=resubmit(,31[DVR_L3_TABLE])
+	   table=31[DVR_L3_TABLE], n_packets=8, n_bytes=656, idle_age=12473, hard_age=65534, priority=1 actions=load:0x1->OXM_OF_METADATA[],resubmit(,0[LOCAL_SWITCHING])
+	   table=32[DVR_DVR_TABLE], n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=1 actions=load:0x1->OXM_OF_METADATA[],resubmit(,0)
+       table=33[DVR_ARP_TABLE], n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=1 actions=load:0->NXM_NX_PKT_MARK[],load:0x1->OXM_OF_METADATA[],resubmit(,0)
+
+    br-tun:
+	   table=0, n_packets=0, n_bytes=0, idle_age=10, hard_age=65534, priority=2,in_port=1(patch-int-ofport) actions=resubmit(,1[DVR_PROCESS table])
+	   如果offline_switch_on = true：
+	       table=9[DVR_NOT_LEARN], n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=2 actions=resubmit(,10[LEARN_FROM_TUN table])
+	   false：
+           table=9[DVR_NOT_LEARN], n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=2 actions=output:1[patch-int-ofport]
+	   table=1[DVR_PROCESS], n_packets=0, n_bytes=0, idle_age=7, hard_age=65534, priority=0 actions=resubmit(,2[PATCH_LV_TO_TUN])
+       install_vpc_dvr_flow_for_tun: table=0, n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=3,pkt_mark=0x7f000001,in_port=1[patch-int-ofport] actions=drop
+	   setup_unicastback_to_tun: table=28[UCAST_TO_INT], n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=2,dl_src=fa:16:3f:87:f4:61 actions=IN_PORT
+	   table=28, n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=0 actions=drop
+
+// enable_vpc_v2= true setup br-router	   
+       self.router_br.create(secure_mode=True)
+       self.router_br.setup_controllers(conf)
+	   创建br-int到br-router的 patch port int-router-ofport 和router-int-ofport
+	   install v2 初始化流表：
+	   br-int 网桥：
+	       table=60[V2_LOCAL_SWITCHING], n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=2,in_port=4[int-router-patch-ofport] actions=resubmit(,61[V2_ROUTER_INGRESS])
+	       table=61[V2_ROUTER_INGRESS], n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=20,dl_dst=fa:00:00:00:00:00/ff:ff:00:00:00:00 actions=output:2[patch_tun_ofport]
+	       table=61, n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=6,dl_dst=01:00:00:00:00:00/01:00:00:00:00:00[unicast/unicast] actions=NORMAL
+		   table=61, n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=4,arp actions=NORMAL
+		   table=61, n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=4, dl_src=fa:fa:fa:fa:fa:01[DHCPV4_SERVER_MAC] actions=NORMAL
+	       if not ifp_enabled
+                table=61, n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=4, ipv6 ipv6_src=fe80::/64[IPV6_LLA_PREFIX] actions=NORMAL
+                table=61, n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=2, ipv6 actions=output:2[patch_tun_ofport]
+           table=61, n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=2,ip actions=output:2
+           table=62[V2_TUN_INGRESS], n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=2,dl_dst=01:00:00:00:00:00/01:00:00:00:00:00[unicast/unicast] actions=load:0x4[int_router_ofport]->OXM_OF_IN_PORT[],NORMAL		   
+           table=60[V2_LOCAL_SWITCHING], n_packets=0, n_bytes=0, idle_age=39909, hard_age=65534, priority=0 actions=NORMAL
+		   table=61[V2_ROUTER_INGRESS], n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=0 actions=drop
+		   table=62[V2_TUN_INGRESS], n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=0 actions=drop
+		   table=63[V2_FG_ARP_REQUEST], n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=0 actions=drop
+		   table=64[V2_FG_ARP_RESPONDER], n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=0 actions=drop
+		   if agent.conf.AGENT.enable_inat_enat=true:
+                table=60[V2_LOCAL_SWITCHING], n_packets=0, n_bytes=0, idle_age=39909, hard_age=65534, priority=100, in_port=4[int_router_ofport],ip dl_dst=fa:01:00:00:00:02[inat_vtep_mac] actions=output:2[patch_tun_ofport]
+                table=60[V2_LOCAL_SWITCHING], n_packets=0, n_bytes=0, idle_age=39909, hard_age=65534, priority=100 in_port=4[int_router_ofport],ip dl_dst=fa:01:00:00:00:03[enat_vtep_mac] actions=output:2[patch_tun_ofport]	
+           if self.agent.enable_ifp_v6 = true:
+		        table=65[V2_IFP_TAG], n_packets=0, n_bytes=0, idle_age=39909, hard_age=65534, priority=0 actions=NORMAL
+                table=66[V2_IFP_L2], n_packets=0, n_bytes=0, idle_age=39909, hard_age=65534, priority=16,ipv6,dl_dst=01:00:00:00:00:00/01:00:00:00:00:00[unicast/unicast] actions=NORMAL				
+				table=66[V2_IFP_L2], n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=0 actions=drop
+			
+       br-router 网桥:
+           if agent.conf.AGENT.enable_inat_enat=true:
+		        table=7[V2_FG], n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=3,ip,dl_dst=fa:01:00:00:00:02[inat_vtep_mac],vlan_id=[ofp.OFPVID_PRESENT, ofp.OFPVID_PRESENT] actions=output:1[router_int_ofport]
+                table=7[V2_FG], n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=3,ip,dl_dst=fa:01:00:00:00:03[enat_vtep_mac],vlan_id=[ofp.OFPVID_PRESENT, ofp.OFPVID_PRESENT] actions=output:1[router_int_ofport]
+           br-router 中 pod_fip_address="100.64.0.0/10"; exclude_relay_cidr="100.125.0.0/16"; isolate_sys_security_cidrs="127.0.0.0/8, 169.254.0.0/16, 224.0.0.0/3"; isolate_sys_security_cidrs_v6=""; 
+		                endpoint_services_cidrs="198.19.32.0/19"; isolate_tenant_cidrs="10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16"; isolate_tenant_cidrs_v6=""	
+		   table=0[V2_PRIMARY], n_packets=0, n_bytes=0, idle_age=0, hard_age=65534, priority=2,in_port=1[router_int_ofport],dl_dst=fa:fa:fa:fa:fa:01[DHCPV4_SERVER_MAC] actions=load:0xfffffffe->OXM_OF_IN_PORT[],resubmit(,3[V2_GW_INGRESS])
+           table=0[V2_PRIMARY], n_packets=0, n_bytes=0, idle_age=0, hard_age=65534, priority=2,in_port=1[router_int_ofport],dl_dst=01:00:00:00:00:00/01:00:00:00:00:00[unicast/unicast] actions=load:0xfffffffe->OXM_OF_IN_PORT[],resubmit(,3[V2_GW_INGRESS])
+           table=1[V2_GW_EGRESS], n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=10, dl_src=fa:fa:fa:fa:fa:01[DHCPV4_SERVER_MAC] actions=drop
+           table=4[V2_ROUTING], n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=0 actions=resubmit(,5[V2_DEFAULT_ROUTING])		   
+           table=4[V2_ROUTING], n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=25000,ip,nw_dst=169.254.0.0/16 actions=drop
+		   table=4[V2_ROUTING], n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=25000,ip,nw_dst=127.0.0.0/8 actions=drop
+		   table=4[V2_ROUTING], n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=25000,ip,nw_dst=224.0.0.0/3 actions=drop
+		   table=4[V2_ROUTING], n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=15070,ip,nw_dst=100.125.0.0/16[exclude_relay_cidr] actions=resubmit(,6[V2_FIP])
+		   table=4[V2_ROUTING], n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=15030,ip,nw_dst=198.19.32.0/19[endpoint_services_cidrs] actions=resubmit(,6[V2_FIP])
+		   table=4[V2_ROUTING], n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=15020,ip,nw_dst=100.64.0.0/10[pod_fip_address] actions=drop
+		   table=7[V2_FG], n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=4,ip,nw_dst=10.0.0.0/8[isolate_tenant_cidrs or isolate_tenant_cidrs_ipv6] actions=drop
+		   table=7[V2_FG], n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=2,ipv6, actions=load:oxa9fe0001[VROUTER_NEXTHOP=169.254.0.1]->NXM_NX_REG1[],resubmit(,8[V2_ARP])
+		   table=[0:V2_PRIMARY,1:V2_GW_EGRESS,2:V2_FG_INGRESS,3:V2_GW_INGRESS,5:V2_DEFAULT_ROUTING,6:V2_FIP,7:V2_FG,8:V2_ARP,9:V2_VIP,10:V2_EGRESS], n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=0 actions=drop
+       br-tun 网桥：
+	       table=0, n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=10, dl_src=fa:fa:fa:fa:fa:01[DHCPV4_SERVER_MAC] actions=drop
+		   table=0, n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=10, dl_dst=fa:fa:fa:fa:fa:01[DHCPV4_SERVER_MAC] actions=drop
+	   
+// enable_vpc_v2= true setup tunnels
+       if self.l2_gateway_ip and not cfg.CONF.AGENT.enable_single_vxlan_tunnel
+	       br-tun上创建到l2_gateway的tunnel port, port_name为${network_type}-${l2_gateway_ip_hex},如vxlan-040d3002[vxlan-hex(4.13.30.2)],然后下一条流表：
+		   table=0, n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=1,in_port=3[l2_gateway的tunnel-port-ofport] actions=resubmit(,4[tunnel table:VXLAN_TUN_TO_LV])
+	   	   
+       增加virtual port and install_virtual_port_flows
+	       add_virtual_tunnel_port. name为${vxlan_type}-vtp；如vxlan-vtp，options为{csum="true", df_default="true", key=flow, local_ip="4.13.49.21", remote_ip=flow}、
+		   if cfg.CONF.AGENT.enable_single_vxlan_tunnel：
+		       table=0, n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=1, actions=resubmit(,4[tunnel table:VXLAN_TUN_TO_LV])
+           else:
+		       table=0, n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=1,in_port=2[virtual-port-ofport] actions=resubmit(,4[tunnel table:VXLAN_TUN_TO_LV])
+		   if dvr_host_mac and l2_gateway_ip:
+		       table=20[UCAST_TO_TUN], n_packets=0, n_bytes=0, idle_age=65534, hard_age=65534, priority=4,vlan_tci=0x1000/0x1000,dl_dst=fa:00:00:00:00:00/ff:ff:00:00:00:00 actions=strip_vlan,move:NXM_OF_ETH_SRC[0..23]->NXM_NX_TUN_ID[0..23],mod_dl_src:fa:16:3f:5d:f8:36[dvr_host_mac],load:0x40d3002[l2_gateway_ip]->NXM_NX_TUN_IPV4_DST[],output:2[virtual-port-ofport]
+           if self.agent.conf.AGENT.enable_inat_enat:
+		               actions = [
+								ofpp.OFPActionSetField(tun_ipv4_dst=inat_vtep_ip),
+								ofpp.OFPActionSetField(eth_src=dvr_base_mac),
+								ofpp.OFPActionOutput(vtp_ofport, 0)
+								]
+					   self.install_apply_actions(table_id=constants.LOCAL_SWITCHING,
+                                   priority=100,
+                                   in_port=in_port,[virtual-port-ofport]
+                                   eth_dst=inat_vtep_mac,
+                                   actions=actions)
+
+						actions = [
+							ofpp.OFPActionSetField(tun_ipv4_dst=enat_vtep_ip),
+							ofpp.OFPActionSetField(eth_src=dvr_base_mac),
+							ofpp.OFPActionOutput(vtp_ofport, 0)
+						]
+						self.install_apply_actions(table_id=constants.LOCAL_SWITCHING,
+												   priority=100,
+												   in_port=in_port,
+												   eth_dst=enat_vtep_mac,
+												   actions=actions)
+//  setup_ancillary_bridges,   # Collect additional bridges to monitor    获取辅助网桥(除去br-int,br-tun,br-cps)
+// 获取split_vlan(default value:4001,The vlan split tun and phys vlan pool,where the phys vlan begins)存储local vlan map 
+// 初始化 addr_group_agent.AddressGroupAgent
+// 初始化 sg_rpc.SecurityGroupAgentRpc
+// 初始化  firewall_l2_agent_v2.FWaaSAgentExtension
+// 初始化 agent_state 实例，心跳上报 agent_state
+// 初始化完成后，start receiving message consumer threads
+       if not cfg.CONF.single_layer_enabled:
+           	rpc connection 启动 consume_in_threads
+// 开启GreenPool协程池处理 fdb 任务
+       if self.enable_vpc_v2 = true:
+            eventlet.spawn_n(self._process_fdb_tasks)   
+       else:
+            eventlet.spawn_n(self._process_fetched_fdb_entries)
+// 处理dhcp cloudinit
+       if self.dhcp_cloudinit_optimiz:
+            eventlet.spawn_n(self._process_prepared_events) 
+			
++------------------------------------------------------------------------------------+ 
+（二）初始化 OVSNeutronAgent 成功，处理轮训任务deamon_loop
++------------------------------------------------------------------------------------+ 
+
+// 处理系统SIGTERM（非单层架构的rpc超时）信号，和SIGHUP（挂起）信号   
+// 处理rpc loop
+     if self.dhcp_cloudinit_optimiz = false:
+        初始化polling.get_polling_manager管理器后处理回调方法_polling_manager_callback
+     else:
+        初始化 polling.get_polling_manager 管理器后，先处理完 _preprocess_dhcp_events_callback 方法后，然后处理回调方法 _polling_manager_callback
+     	_preprocess_dhcp_events_callback 方法的参数为ovs-monitor返回后的数据。ovs-monitor exec command：ovsdb-client monitor Interface name,ofport,external_ids --format=json 来获取ovs所有ofport的信息
+        _polling_manager_callback 方法的参数为ovs-monitor返回数据进行处理后的信息。数据格式为{"add":[device-1,device-2,...],"removed":[device-1,device-2,...]}; device-{n}的数据格式：
+            {"name":{ofport-name},"ofport":{ofport-id},"external_ids":{ofport-external-ids}}
+     			
+     tips：
+        _preprocess_dhcp_events_callback 该方法	主要是处理从ovs-monitor获取的ofport 数据。将符合条件的ofport 保存到_prepared_events有序字典中。ofport需要满足的条件：ofport-id，external_ids不为空，action
+		值为insert or delete，name为非vxlan-qvm开头，external_ids字段中必须存在iface-id，attached-mac，network-id，network-type属性。
+		_polling_manager_callback 该方法主要是处理从ovs-monitor获取的removed 的name以dum开头的port数据。然后通过vpc_extension_driver删除dum port
+	
+     初始化完 polling_manager 后进行 rpc loop轮询处理：
+	     ovs status 状态为 dead：
+		     轮询ovs状态
+	     ovs status 状态为 restarted：
+             通知所有的agent extension ovs已经重启过
+             Setup the integration bridge			 
+		     Setup the physical network bridges.初始化 brcps
+			 初始化 br-tun 网桥；vpc_extension_driver初始化 pod tunnel；vpc_v2_extension_driver 初始化tunnel
+			 dvr agent reset ovs相关patch port，重置ovs 参数，初始化ovs dvr flows。
+			 vlan manager clear
+			 如果enable_ipv6，重新初始化ipv6相关流表，重新配置ifp v6 配置；fwaas_agent clear相关参数。
+			 重新进行 tunnel sync
+			 重启polling_manager 操作
+		 裸机扩展驱动 sync baremaetal vifs
+         如果ofport	发生update 或者需要 sync：
+		     处理ofport—info（包括deleted 的of-port；change的of-port等，这里会处理_preprocess_dhcp_events_callback方法得到的_prepared_events有序字典中的ofport），fdb process；dvr agent变更子网路由信息等。
+		  	 
+
+	
