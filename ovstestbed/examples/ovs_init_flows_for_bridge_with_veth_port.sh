@@ -17,12 +17,12 @@ done
 for i in ${!ofports[*]};
 do
 ovs-ofctl add-flow br-int "table=0,priority=100,in_port=1,actions=goto_table:4"
-  `ovs-ofctl add-flow ${br_name} "table=0,priority=100,in_port=${i},actions=goto_table:4"`
-  `ovs-ofctl add-flow ${br_name} "table=4,priority=100,in_port=${i},dl_src=${ofports_mac[$i]},actions=goto_table:8"`
-  `ovs-ofctl add-flow ${br_name} "table=4,priority=200,arp,in_port=${i},dl_src=${ofports_mac[$i]},actions=goto_table:6"`
+  `ovs-ofctl add-flow ${br_name} "table=0,priority=100,in_port=${ofports[$i]},actions=goto_table:4"`
+  `ovs-ofctl add-flow ${br_name} "table=4,priority=100,in_port=${ofports[$i]},dl_src=${ofports_mac[$i]},actions=goto_table:8"`
+  `ovs-ofctl add-flow ${br_name} "table=4,priority=200,arp,in_port=${ofports[$i]},dl_src=${ofports_mac[$i]},actions=goto_table:6"`
   `ovs-ofctl add-flow ${br_name} "table=6,priority=100,arp,arp_op=1,arp_tpa=${ofports_ip[$i]} actions=move:NXM_OF_ETH_SRC[]->NXM_OF_ETH_DST[],move:NXM_OF_ARP_SPA[]->NXM_OF_ARP_TPA[],move:NXM_NX_ARP_SHA[]->NXM_NX_ARP_THA[],set_field:${ofports_mac[$i]}->eth_src,set_field:${ofports_mac[$i]}->arp_sha,set_field:${ofports_ip[$i]}->arp_spa,set_field:2->arp_op,IN_PORT"`
-  `ovs-ofctl add-flow ${br_name} "table=6,priority=100,arp,arp_op=2,arp_tpa=${ofports_ip[$i]},dl_src=${ofports_mac[$i]} actions=output:${i}"`
+  `ovs-ofctl add-flow ${br_name} "table=6,priority=100,arp,arp_op=2,arp_tpa=${ofports_ip[$i]},dl_src=${ofports_mac[$i]} actions=output:${ofports[$i]}"`
   `ovs-ofctl add-flow ${br_name} "table=8,priority=100,ip,nw_dst=${ofports_ip[$i]},actions=set_field:${ofports[$i]}->reg5,goto_table:12"`
   `ovs-ofctl add-flow ${br_name} "table=12,priority=100,actions=goto_table:16"`
-  `ovs-ofctl add-flow ${br_name} "table=16,priority=100,reg5=${i}, actions=output:${i}"`
+  `ovs-ofctl add-flow ${br_name} "table=16,priority=100,reg5=${ofports[$i]}, actions=output:${ofports[$i]}"`
 done
