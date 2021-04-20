@@ -10,7 +10,7 @@ br_name="br-int"
 tables=(0 4 6 8 12 16)
 for i in ${!tables[*]};
 do
-  `ovs-ofctl add-flow ${br_name} "table=${i},priority=10,actions=drop"`
+  `ovs-ofctl add-flow ${br_name} "table=${tables[${i}]},priority=10,actions=drop"`
 done
 
 
